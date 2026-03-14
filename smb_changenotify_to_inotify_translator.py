@@ -151,20 +151,37 @@ RECONNECT_DELAY = 5
 EVENT_COOLDOWN = 2  # seconds — suppress duplicate events from SMB burst-firing
 
 DEFAULT_CONFIG = {
-    "smb_server": "192.168.1.50",
-    "smb_port": 445,
-    "smb_username": "user",
-    "smb_password": "password",
-    "watches": [
+    "servers": [
         {
-            "share": "example",
-            "remote_path": "Video",
-            "local_path": "/media/video",
+            "smb_server": "192.168.1.50",
+            "smb_port": 445,
+            "smb_username": "mediauser",
+            "smb_password": "secret123",
+            "watches": [
+                {
+                    "share": "media",
+                    "remote_path": "Video",
+                    "local_path": "/media/video",
+                },
+                {
+                    "share": "media",
+                    "remote_path": "Music",
+                    "local_path": "/media/music",
+                },
+            ],
         },
         {
-            "share": "example",
-            "remote_path": "Music",
-            "local_path": "/media/music",
+            "smb_server": "192.168.1.51",
+            "smb_port": 445,
+            "smb_username": "backupuser",
+            "smb_password": "hunter2",
+            "watches": [
+                {
+                    "share": "backups",
+                    "remote_path": "Photos",
+                    "local_path": "/media/photos",
+                },
+            ],
         },
     ],
 }
@@ -565,46 +582,48 @@ def uninstall_all():
 def test_connection():
     """Connect to each share and list the root directory contents, then exit."""
     config = load_config()
-    server = config["smb_server"]
-    port = config.get("smb_port", 445)
-    username = config["smb_username"]
-    password = config["smb_password"]
 
-    for watch in config["watches"]:
-        share_name = watch["share"]
-        remote_path = watch["remote_path"]
-        conn = None
-        try:
-            conn, session, tree = connect_to_share(server, port, username, password, share_name)
-            dir_handle = open_directory(tree, remote_path)
+    for srv in config["servers"]:
+        server = srv["smb_server"]
+        port = srv.get("smb_port", 445)
+        username = srv["smb_username"]
+        password = srv["smb_password"]
 
-            from smbprotocol.file_info import FileInformationClass
-            entries = dir_handle.query_directory(
-                "*",
-                FileInformationClass.FILE_DIRECTORY_INFORMATION,
-            )
+        for watch in srv["watches"]:
+            share_name = watch["share"]
+            remote_path = watch["remote_path"]
+            conn = None
+            try:
+                conn, session, tree = connect_to_share(server, port, username, password, share_name)
+                dir_handle = open_directory(tree, remote_path)
 
-            label = f"\\\\{server}\\{share_name}\\{remote_path}" if remote_path else f"\\\\{server}\\{share_name}"
-            print(f"\n{label}:")
-            for entry in entries:
-                name = entry["file_name"].get_value()
-                if isinstance(name, bytes):
-                    name = name.decode("utf-16-le").rstrip("\x00")
-                if name in (".", ".."):
-                    continue
-                attrs = entry["file_attributes"].get_value()
-                is_dir = bool(attrs & FileAttributes.FILE_ATTRIBUTE_DIRECTORY)
-                prefix = "[DIR] " if is_dir else "      "
-                print(f"  {prefix}{name}")
+                from smbprotocol.file_info import FileInformationClass
+                entries = dir_handle.query_directory(
+                    "*",
+                    FileInformationClass.FILE_DIRECTORY_INFORMATION,
+                )
 
-        except Exception as e:
-            log.error("Test failed for %s\\%s: %s", share_name, remote_path, e)
-        finally:
-            if conn:
-                try:
-                    conn.disconnect()
-                except Exception:
-                    pass
+                label = f"\\\\{server}\\{share_name}\\{remote_path}" if remote_path else f"\\\\{server}\\{share_name}"
+                print(f"\n{label}:")
+                for entry in entries:
+                    name = entry["file_name"].get_value()
+                    if isinstance(name, bytes):
+                        name = name.decode("utf-16-le").rstrip("\x00")
+                    if name in (".", ".."):
+                        continue
+                    attrs = entry["file_attributes"].get_value()
+                    is_dir = bool(attrs & FileAttributes.FILE_ATTRIBUTE_DIRECTORY)
+                    prefix = "[DIR] " if is_dir else "      "
+                    print(f"  {prefix}{name}")
+
+            except Exception as e:
+                log.error("Test failed for %s\\%s: %s", share_name, remote_path, e)
+            finally:
+                if conn:
+                    try:
+                        conn.disconnect()
+                    except Exception:
+                        pass
 
 
 def main():
@@ -633,40 +652,45 @@ def main():
 
     config = load_config()
 
-    server = config["smb_server"]
-    port = config.get("smb_port", 445)
-    username = config["smb_username"]
-    password = config["smb_password"]
-    watches = config["watches"]
+    servers = config["servers"]
+    total_watches = sum(len(srv["watches"]) for srv in servers)
 
     log.info("SMB ChangeNotify to inotify Translator")
-    log.info("Server: %s:%d", server, port)
-    log.info("Watches: %d", len(watches))
+    log.info("Servers: %d", len(servers))
+    log.info("Watches: %d", total_watches)
     log.info("Kernel module: %s", INOTIFY_TRIGGER)
 
     threads = []
-    for watch in watches:
-        t = threading.Thread(
-            target=watch_loop,
-            args=(
-                server,
-                port,
-                username,
-                password,
+    for srv in servers:
+        server = srv["smb_server"]
+        port = srv.get("smb_port", 445)
+        username = srv["smb_username"]
+        password = srv["smb_password"]
+
+        log.info("Server: %s:%d (%d watches)", server, port, len(srv["watches"]))
+
+        for watch in srv["watches"]:
+            t = threading.Thread(
+                target=watch_loop,
+                args=(
+                    server,
+                    port,
+                    username,
+                    password,
+                    watch["share"],
+                    watch["remote_path"],
+                    watch["local_path"],
+                ),
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+            log.info(
+                "  -> %s\\%s -> %s",
                 watch["share"],
                 watch["remote_path"],
                 watch["local_path"],
-            ),
-            daemon=True,
-        )
-        t.start()
-        threads.append(t)
-        log.info(
-            "  -> %s\\%s -> %s",
-            watch["share"],
-            watch["remote_path"],
-            watch["local_path"],
-        )
+            )
 
     log.info("All watchers started. Press Ctrl+C to stop.")
 

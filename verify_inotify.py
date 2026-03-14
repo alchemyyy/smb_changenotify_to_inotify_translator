@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 
@@ -25,25 +26,58 @@ def main():
     with open(config_path) as f:
         config = json.load(f)
 
-    paths = [w["local_path"] for w in config["watches"] if os.path.exists(w["local_path"])]
+    # Map each local_path back to its server + username for display
+    path_to_server = {}
+    paths = []
+    for srv in config["servers"]:
+        server = srv["smb_server"]
+        username = srv["smb_username"]
+        for w in srv["watches"]:
+            lp = w["local_path"]
+            if os.path.exists(lp):
+                paths.append(lp)
+                path_to_server[lp] = (server, username, w["share"], w["remote_path"])
+
     if not paths:
         print("No valid local_path entries found in config.")
         sys.exit(1)
 
     print("Watching for inotify events on:")
     for p in paths:
-        print(f"  {p}")
+        server, username, share, remote = path_to_server[p]
+        print(f"  {p}  <-  {username}@{server}\\{share}\\{remote}")
     print()
-    print("Make a change on the SMB server and see if events appear here.")
+    print("Make a change on an SMB server and see if events appear here.")
     print("Ctrl+C to stop.\n")
 
+    def watch_path(local_path, server, username, share):
+        """Run inotifywait on a single path, prefixing output with server info."""
+        tag = f"[{username}@{server}\\{share}]"
+        try:
+            proc = subprocess.Popen(
+                ["inotifywait", "-m", "--format", "%T %e %w%f", "--timefmt", "%H:%M:%S", local_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    print(f"{tag} {line}", flush=True)
+        except FileNotFoundError:
+            print("inotifywait not found. Install it: apt-get install inotify-tools")
+            sys.exit(1)
+
+    threads = []
+    for p in paths:
+        server, username, share, remote = path_to_server[p]
+        t = threading.Thread(target=watch_path, args=(p, server, username, share), daemon=True)
+        t.start()
+        threads.append(t)
+
     try:
-        subprocess.run(
-            ["inotifywait", "-m", "--format", "%T %e %w%f", "--timefmt", "%H:%M:%S"] + paths,
-        )
-    except FileNotFoundError:
-        print("inotifywait not found. Install it: apt-get install inotify-tools")
-        sys.exit(1)
+        while True:
+            pass
     except KeyboardInterrupt:
         pass
 
