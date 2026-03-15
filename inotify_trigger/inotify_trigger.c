@@ -2,17 +2,33 @@
 /*
  * inotify_trigger — inject inotify events without filesystem operations
  *
- * Exposes /proc/inotify_trigger.  Write "<hex_mask> <path>" to fire an
- * inotify event on any path.  Calls the kernel's fsnotify() directly on
- * the resolved inode — no filesystem operation occurs, no data touches
- * the backing storage, and the event is indistinguishable from a real
- * VFS-generated one.
+ * Exposes /proc/inotify_trigger.  Write to it to fire inotify events
+ * on any path.  Calls the kernel's fsnotify() directly — no filesystem
+ * operation occurs, no data touches the backing storage, and the event
+ * is indistinguishable from a real VFS-generated one.
+ *
+ * Two formats:
+ *
+ *   1. Self-event (original):
+ *        "<mask> <path>"
+ *      Fires on the inode itself + its parent.
+ *
+ *   2. Directory + child name (for NFS / recursive watchers):
+ *        "<mask> <dir_path>\t<child_name>"
+ *      Resolves dir_path and fires "child_name changed in dir_path",
+ *      which is the exact event inotify watchers on dir_path receive.
+ *      child_name may contain slashes (e.g. "Albums/NewAlbum/song.flac").
+ *      Only dir_path needs to exist — child_name is passed as the event
+ *      name without any path resolution.
  *
  * Usage from userspace:
+ *   # Self-events:
  *   echo "0x2 /media/music/song.flac"   > /proc/inotify_trigger   # IN_MODIFY
- *   echo "0x100 /media/music/new.flac"  > /proc/inotify_trigger   # IN_CREATE
- *   echo "0x200 /media/music/old.flac"  > /proc/inotify_trigger   # IN_DELETE
  *   echo "0x4 /media/music/SomeAlbum"   > /proc/inotify_trigger   # IN_ATTRIB
+ *
+ *   # Dir + child (preferred for NFS):
+ *   printf "0x100 /media/music\tAlbums/new.flac"  > /proc/inotify_trigger  # IN_CREATE
+ *   printf "0x200 /media/music\told.flac"          > /proc/inotify_trigger  # IN_DELETE
  *
  * Multiple events can be batched (one per line) in a single write().
  *
@@ -26,6 +42,7 @@
 #include <linux/uaccess.h>
 #include <linux/namei.h>
 #include <linux/fs.h>
+#include <linux/fsnotify.h>
 #include <linux/fsnotify_backend.h>
 #include <linux/slab.h>
 #include <linux/version.h>
@@ -35,59 +52,109 @@
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Inject inotify events without filesystem operations");
-MODULE_VERSION("1.0");
+MODULE_VERSION("1.2");
 
 static struct proc_dir_entry *proc_entry;
 
 /*
- * Fire a single inotify event.
+ * Fire a self-event on an inode (original mode).
  *
- * Resolves @path_str to a dentry/inode via kern_path(), then calls
- * fsnotify() which delivers the event to every inotify (and fanotify)
- * watcher on that inode AND its parent directory.  No filesystem I/O.
+ * Resolves @path_str to a dentry/inode, then fires using the two-phase
+ * VFS pattern: fsnotify_parent() + fsnotify() self-event.
  */
-static int fire_event(const char *path_str, __u32 mask)
+static int fire_self_event(const char *path_str, __u32 mask)
 {
 	struct path path;
 	struct dentry *dentry;
 	struct inode *inode;
-	struct inode *dir_inode;
 	int ret;
 
 	ret = kern_path(path_str, LOOKUP_FOLLOW, &path);
-	if (ret)
+	if (ret) {
+		pr_debug("inotify_trigger: kern_path failed: %d for '%s'\n",
+			 ret, path_str);
 		return ret;
+	}
 
-	dentry    = path.dentry;
-	inode     = d_inode(dentry);
-	dir_inode = d_inode(dentry->d_parent);
+	dentry = path.dentry;
+	inode  = d_inode(dentry);
 
-	/* Tag directories so fsnotify routes correctly */
 	if (S_ISDIR(inode->i_mode))
 		mask |= FS_ISDIR;
 
-	/*
-	 * This is the whole trick.  fsnotify() pushes the event into
-	 * every fsnotify group (inotify, fanotify) that has a mark on
-	 * either @inode or @dir_inode.  Passing dir_inode + d_name
-	 * causes parent-directory watchers to see the event too (with
-	 * FS_EVENT_ON_CHILD), exactly as a real VFS operation would.
-	 *
-	 * The backing filesystem is never touched.
-	 */
-	fsnotify(mask, dentry, FSNOTIFY_EVENT_DENTRY,
-		 dir_inode, &dentry->d_name, inode, 0);
+	pr_debug("inotify_trigger: self-event 0x%x on ino %lu '%s'\n",
+		 mask, inode->i_ino, path_str);
+
+	fsnotify_parent(dentry, mask, dentry, FSNOTIFY_EVENT_DENTRY);
+	fsnotify(mask, dentry, FSNOTIFY_EVENT_DENTRY, NULL, NULL, inode, 0);
 
 	path_put(&path);
 	return 0;
 }
 
 /*
- * Parse one line: "<hex_or_dec_mask> <absolute_path>"
+ * Fire a directory + child event (NFS mode).
+ *
+ * Resolves @dir_path to a directory inode, then fires fsnotify() with
+ * the child name — exactly what inotify watchers on the directory see
+ * when VFS helpers like fsnotify_create()/fsnotify_modify() fire.
+ *
+ * Only @dir_path needs to exist.  @child_name is passed as the event
+ * name without any path resolution, so it works for creates/deletes
+ * where the child may or may not exist.
+ */
+static int fire_dir_event(const char *dir_path, const char *child_name,
+			  __u32 mask)
+{
+	struct path path;
+	struct inode *dir_inode;
+	struct qstr qname;
+	int ret;
+
+	ret = kern_path(dir_path, LOOKUP_FOLLOW, &path);
+	if (ret) {
+		pr_debug("inotify_trigger: kern_path failed: %d for '%s'\n",
+			 ret, dir_path);
+		return ret;
+	}
+
+	dir_inode = d_inode(path.dentry);
+
+	if (!S_ISDIR(dir_inode->i_mode)) {
+		pr_debug("inotify_trigger: '%s' is not a directory\n",
+			 dir_path);
+		path_put(&path);
+		return -ENOTDIR;
+	}
+
+	qname.hash = 0;
+	qname.name = child_name;
+	qname.len  = strlen(child_name);
+
+	pr_debug("inotify_trigger: dir-event 0x%x dir='%s' child='%s'\n",
+		 mask, dir_path, child_name);
+
+	/*
+	 * This is the same call pattern as fsnotify_dirent() which is
+	 * used by fsnotify_create(), fsnotify_link(), etc.  It delivers
+	 * the event to inotify watchers on the directory with child_name
+	 * as the filename in the inotify_event structure.
+	 */
+	fsnotify(mask, path.dentry, FSNOTIFY_EVENT_DENTRY,
+		 dir_inode, &qname, NULL, 0);
+
+	path_put(&path);
+	return 0;
+}
+
+/*
+ * Parse one line.  Two formats:
+ *   "<mask> <path>"              — self-event on the inode
+ *   "<mask> <dir_path>\t<child>" — dir + child event (for NFS)
  */
 static int process_line(char *line)
 {
-	char *path_str;
+	char *path_str, *child_name;
 	unsigned int mask;
 	int ret;
 
@@ -112,7 +179,16 @@ static int process_line(char *line)
 	if (!mask)
 		return -EINVAL;
 
-	return fire_event(path_str, mask);
+	/* Check for tab separator: dir_path\tchild_name */
+	child_name = strchr(path_str, '\t');
+	if (child_name) {
+		*child_name++ = '\0';
+		if (!*child_name)
+			return -EINVAL;
+		return fire_dir_event(path_str, child_name, mask);
+	}
+
+	return fire_self_event(path_str, mask);
 }
 
 static ssize_t trigger_write(struct file *file, const char __user *ubuf,
@@ -151,12 +227,8 @@ static ssize_t trigger_write(struct file *file, const char __user *ubuf,
 			line[--len] = '\0';
 
 		ret = process_line(line);
-		/*
-		 * ENOENT is expected for deleted/moved files — the Python
-		 * script handles this by falling back to the parent dir.
-		 * All other errors are real failures.
-		 */
-		if (ret && ret != -ENOENT) {
+		if (ret) {
+			pr_debug("inotify_trigger: process_line error: %d\n", ret);
 			kfree(buf);
 			return ret;
 		}
@@ -177,7 +249,8 @@ static int __init inotify_trigger_init(void)
 	if (!proc_entry)
 		return -ENOMEM;
 
-	pr_info("inotify_trigger: /proc/%s ready\n", PROCFS_NAME);
+	pr_info("inotify_trigger: /proc/%s ready (v1.2 dir+child mode)\n",
+		PROCFS_NAME);
 	return 0;
 }
 
