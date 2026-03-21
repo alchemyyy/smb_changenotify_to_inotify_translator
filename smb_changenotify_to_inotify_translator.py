@@ -304,19 +304,21 @@ def open_directory(tree, path):
 # ---------------------------------------------------------------------------
 
 def replay_event(action, relative_path, local_root):
-    """Inject an inotify event for a remote change via the kernel module.
+    """Inject inotify events for a remote change via the kernel module.
 
     Writes to /proc/inotify_trigger which calls fsnotify() directly on
     the resolved inode.  Zero filesystem operations, correct event types
     (CREATE/DELETE/MODIFY — not just ATTRIB from utime), no feedback loop.
 
-    Events are fired on the immediate parent directory with just the
-    filename as the child — matching real VFS/inotify behavior.  .NET's
-    FileSystemWatcher (used by Jellyfin) creates individual inotify watches
-    on every subdirectory and expects events in this form.
+    Fires TWO events per change:
+      1. Root-level: on local_root with full relative path as child name.
+         This is what Navidrome (Go fsnotify) expects.
+      2. Parent-level: on the immediate parent directory with just the
+         filename.  This is what Jellyfin (.NET FileSystemWatcher) expects,
+         since it creates individual inotify watches on every subdirectory.
 
-    Falls back to firing on local_root if the parent directory can't be
-    resolved (e.g. new directories not yet visible on NFS).
+    Both are zero-cost (no filesystem I/O) and apps ignore events on
+    watches they don't hold.
     """
     relative_path = relative_path.replace("\\", "/")
     local_path = os.path.join(local_root, relative_path)
@@ -327,31 +329,35 @@ def replay_event(action, relative_path, local_root):
         log.debug("%-12s %s (no inotify mapping)", action_name, local_path)
         return
 
-    # Fire on the immediate parent directory with just the filename.
-    # This matches how real inotify events work: the kernel fires on the
-    # directory containing the changed file, with the basename as the name.
-    # .NET's FileSystemWatcher expects this pattern — it sets up individual
-    # inotify watches on every subdirectory and looks for events there.
-    parent_rel = os.path.dirname(relative_path)
-    child_name = os.path.basename(relative_path)
+    # Fire TWO events to cover different application expectations:
+    #
+    # 1. Root-level: fire on local_root with full relative path as child.
+    #    Navidrome (Go fsnotify) expects this — it watches the root and
+    #    uses the deep child path for selective scanning.
+    #
+    # 2. Parent-level: fire on the immediate parent dir with just the
+    #    filename.  Jellyfin (.NET FileSystemWatcher) expects this — it
+    #    creates individual inotify watches on every subdirectory.
+    #
+    # Both are cheap (no filesystem I/O), and apps ignore events on
+    # watches they don't hold, so there's no harm in firing both.
 
+    # (1) Root-level event (Navidrome, inotifywait, etc.)
+    if _inject_inotify(local_root, mask, child_name=relative_path):
+        log.info("%-12s %s (root: %s)", action_name, local_path, local_root)
+    else:
+        log.error("%-12s %s (root inject failed)", action_name, local_path)
+
+    # (2) Parent-level event (Jellyfin / .NET FileSystemWatcher)
+    parent_rel = os.path.dirname(relative_path)
     if parent_rel:
         parent_dir = os.path.join(local_root, parent_rel)
-    else:
-        parent_dir = local_root
-
-    if _inject_inotify(parent_dir, mask, child_name=child_name):
-        log.info("%-12s %s (on %s)", action_name, local_path, parent_dir)
-    elif parent_rel:
-        # Parent directory might not be in the local dentry cache yet
-        # (e.g. new directory on NFS).  Fall back to root with full path.
-        log.debug("Parent inject failed, falling back to root: %s", local_root)
-        if _inject_inotify(local_root, mask, child_name=relative_path):
-            log.info("%-12s %s (on %s, fallback)", action_name, local_path, local_root)
+        child_name = os.path.basename(relative_path)
+        if _inject_inotify(parent_dir, mask, child_name=child_name):
+            log.info("%-12s %s (parent: %s)", action_name, local_path, parent_dir)
         else:
-            log.error("%-12s %s (inject failed)", action_name, local_path)
-    else:
-        log.error("%-12s %s (inject failed)", action_name, local_path)
+            log.debug("%-12s %s (parent inject failed, dir may not be cached)",
+                      action_name, local_path)
 
 
 # ---------------------------------------------------------------------------

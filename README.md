@@ -139,12 +139,12 @@ Stops the service, removes the systemd unit, unloads the kernel module, and remo
 - SMB2 CHANGE_NOTIFY watches are recursive — a single watch on a directory covers the entire subtree.
 - Duplicate events from SMB burst-firing are suppressed with a 2-second cooldown per (action, path) pair.
 - The correct inotify event type is injected (IN_CREATE, IN_DELETE, IN_MODIFY, IN_MOVED_FROM, IN_MOVED_TO) — not a generic IN_ATTRIB.
-- The dir+child format means only the watch root directory needs to exist in the local dentry cache. Child paths are passed as strings without resolution, so newly created files and deleted files are handled correctly regardless of NFS cache state.
+- Each change fires **two events** to cover different application expectations: (1) on the watch root with the full relative path as child (for Navidrome/Go fsnotify), and (2) on the immediate parent directory with just the filename (for Jellyfin/.NET FileSystemWatcher). Both are zero-cost fsnotify() calls — apps ignore events on watches they don't hold.
 
 ## Confirmed working with
 
-- **Navidrome** — Uses `rjeczalik/notify` (Go inotify wrapper) with recursive watches and selective scanning. The dir+child event provides the full path so `DevSelectiveWatcher` can target the exact changed folder.
-- **Jellyfin** — Uses .NET `FileSystemWatcher` with `IncludeSubdirectories = true`. The full child path maps to `FileSystemEventArgs.FullPath`, enabling targeted library item refresh instead of full rescans.
+- **Navidrome** — Uses `rjeczalik/notify` (Go inotify wrapper) with recursive watches and selective scanning. Receives the root-level event with the full relative path, so `DevSelectiveWatcher` can target the exact changed folder.
+- **Jellyfin** — Uses .NET `FileSystemWatcher` with `IncludeSubdirectories = true`, which creates individual inotify watches on every subdirectory. Receives the parent-level event with just the filename — matching the exact pattern .NET expects, enabling targeted library item refresh instead of full rescans.
 - **inotifywait** — Standard Linux inotify debugging tool. Events show the child name correctly.
 
 
@@ -177,13 +177,17 @@ SMB2 CHANGE_NOTIFY fires
         |
 Python script receives notification
         |
-Writes to /proc/inotify_trigger (dir + child format)
+Fires TWO inotify events via /proc/inotify_trigger:
         |
-Kernel module calls fsnotify() with dir inode + child name
+        +-- (1) Root-level: watch root + full relative path as child
+        |       -> Navidrome (Go fsnotify) picks this up
         |
-inotify delivers event to all watchers on that directory
+        +-- (2) Parent-level: immediate parent dir + filename as child
+                -> Jellyfin (.NET FileSystemWatcher) picks this up
         |
-Jellyfin/Navidrome/Plex see the exact file that changed
+Kernel module calls fsnotify() for each — zero filesystem I/O
+        |
+Applications see the exact file that changed
 ```
 
 Zero filesystem operations in the entire chain. The data mount (NFS, SMB, whatever) is never touched.
@@ -239,7 +243,7 @@ Every event is a nameless self-event on the root directory. It says "something h
 
 **Problem with applications:** Navidrome uses `rjeczalik/notify` (Go library wrapping inotify) with `DevSelectiveWatcher = true` — it only scans the specific folder identified by the event path. A nameless event on the root causes it to scan only the root directory, missing all nested changes. Jellyfin uses .NET's `FileSystemWatcher` which needs `e.FullPath` to find the affected library item. With no child name, it can't identify what changed.
 
-### Attempt 4 (final): Dir + child name format
+### Attempt 4: Dir + child name format (root-level)
 
 The correct inotify semantic for "file X was created in directory Y" is:
 
@@ -249,18 +253,31 @@ fsnotify(mask, dir_dentry, FSNOTIFY_EVENT_DENTRY, dir_inode, &child_qstr, NULL, 
 
 This is exactly what `fsnotify_dirent()` / `fsnotify_create()` / `fsnotify_modify()` call internally. It delivers the event to inotify watchers on the directory with the child's name in the `inotify_event.name` field.
 
-The key insight: **only the directory needs to exist and be resolvable.** The child name is just a string passed through to userspace — no path resolution, no dentry lookup, no NFS cache dependency.
+The first version fired on the **watch root** with the full relative path as child name:
 
 ```
 Format: "<mask> <dir_path>\t<child_name>"
 Example: "0x100 /shares/music\tAlbums/NewAlbum/song.flac"
 ```
 
-The kernel module resolves `/shares/music` (always cached, always exists), then fires `fsnotify()` with `"Albums/NewAlbum/song.flac"` as the child name. Applications see:
+This worked for Navidrome and inotifywait — they accept deep relative paths in the name field. But .NET's `FileSystemWatcher` (used by Jellyfin) creates individual inotify watches on **every subdirectory**. It expects events on the immediate parent directory with just the filename — a name containing slashes is non-standard and doesn't match any of its per-subdirectory watches.
 
-- **Navidrome** (`rjeczalik/notify`): Receives event path `/shares/music/Albums/NewAlbum/song.flac`, walks up to find the parent folder, selectively scans it.
-- **Jellyfin** (.NET `FileSystemWatcher`): Receives `e.FullPath = "/shares/music/Albums/NewAlbum/song.flac"`, finds the library item, queues a targeted metadata refresh.
-- **inotifywait**: Shows `CREATE Albums/NewAlbum/song.flac` on the `/shares/music/` watch.
+### Attempt 5 (final): Fire both root-level and parent-level events
+
+Switching to parent-only events fixed Jellyfin but broke Navidrome — Go's `fsnotify` expects the deep relative path from the root watch. The solution: **fire both**.
+
+Each SMB change notification produces two `fsnotify()` calls:
+
+```
+(1) Root-level:   "0x100 /shares/music\tAlbums/NewAlbum/song.flac"
+(2) Parent-level: "0x100 /shares/music/Albums/NewAlbum\tsong.flac"
+```
+
+- **Navidrome** (`rjeczalik/notify`): Picks up event (1) on its root watch, sees the full relative path, selectively scans the right folder.
+- **Jellyfin** (.NET `FileSystemWatcher`): Picks up event (2) on its per-subdirectory watch for `/shares/music/Albums/NewAlbum`, sees `song.flac` — exactly what it expects.
+- **inotifywait**: Shows both events.
+
+Both calls are zero-cost (no filesystem I/O), and apps ignore events on watches they don't hold. If the parent directory can't be resolved (e.g., a brand new directory not yet in the NFS dentry cache), the parent-level event is silently skipped — the root-level event still covers it.
 
 ### Summary of the notification mechanism landscape
 
@@ -269,7 +286,9 @@ The kernel module resolves `/shares/music` (always cached, always exists), then 
 | `fsnotify()` on file inode | Yes | No (ENOENT race) | No (self-event) |
 | `fsnotify_parent()` + `fsnotify()` | Yes | No (DCACHE flag missing) | Depends |
 | `fsnotify()` on root dir (self-event) | Yes | Yes | No |
-| **`fsnotify()` on dir with child name** | **Yes** | **Yes** | **Yes** |
+| `fsnotify()` on root dir with deep child path | Yes | Yes | Yes (Navidrome) / No (Jellyfin) |
+| `fsnotify()` on parent dir with basename | Yes | Yes | No (Navidrome) / Yes (Jellyfin) |
+| **Both root-level + parent-level** | **Yes** | **Yes** | **Yes (all apps)** |
 
 ### Why not just use utime/touch/filesystem operations?
 
