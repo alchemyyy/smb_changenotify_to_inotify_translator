@@ -23,6 +23,7 @@ Single script, runs on the client side only. Nothing to install on the server.
 import json
 import logging
 import os
+import signal
 import struct
 import subprocess
 import sys
@@ -103,8 +104,10 @@ except ImportError:
 from smbprotocol.session import Session
 from smbprotocol.tree import TreeConnect
 
+DEBUG = "--debug" in sys.argv
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if DEBUG else logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -191,18 +194,29 @@ DEFAULT_CONFIG = {
 # Kernel module interface
 # ---------------------------------------------------------------------------
 
-def _inject_inotify(path, mask):
+def _inject_inotify(dir_path, mask, child_name=None):
     """Inject an inotify event via the kernel module.
 
-    Writes to /proc/inotify_trigger which calls fsnotify() directly
-    on the resolved inode.  Zero filesystem I/O.  Returns True on
-    success, False if the path doesn't exist or the write fails.
+    Writes to /proc/inotify_trigger which calls fsnotify() directly.
+    Zero filesystem I/O.
+
+    If child_name is given, uses dir+child format so that inotify
+    watchers on dir_path see the event with child_name as the filename.
+    Only dir_path needs to exist — child_name is not resolved.
+
+    Returns True on success, False on failure.
     """
+    if child_name:
+        payload = f"0x{mask:x} {dir_path}\t{child_name}"
+    else:
+        payload = f"0x{mask:x} {dir_path}"
     try:
         with open(INOTIFY_TRIGGER, "w") as f:
-            f.write(f"0x{mask:x} {path}")
+            f.write(payload)
+        log.debug("inject OK: %s", payload)
         return True
-    except OSError:
+    except OSError as e:
+        log.debug("inject FAILED: %s — %s", payload, e)
         return False
 
 
@@ -295,6 +309,14 @@ def replay_event(action, relative_path, local_root):
     Writes to /proc/inotify_trigger which calls fsnotify() directly on
     the resolved inode.  Zero filesystem operations, correct event types
     (CREATE/DELETE/MODIFY — not just ATTRIB from utime), no feedback loop.
+
+    Events are fired on the immediate parent directory with just the
+    filename as the child — matching real VFS/inotify behavior.  .NET's
+    FileSystemWatcher (used by Jellyfin) creates individual inotify watches
+    on every subdirectory and expects events in this form.
+
+    Falls back to firing on local_root if the parent directory can't be
+    resolved (e.g. new directories not yet visible on NFS).
     """
     relative_path = relative_path.replace("\\", "/")
     local_path = os.path.join(local_root, relative_path)
@@ -305,23 +327,29 @@ def replay_event(action, relative_path, local_root):
         log.debug("%-12s %s (no inotify mapping)", action_name, local_path)
         return
 
-    # Try the exact path first
-    if _inject_inotify(local_path, mask):
-        log.info("%-12s %s", action_name, local_path)
-        return
+    # Fire on the immediate parent directory with just the filename.
+    # This matches how real inotify events work: the kernel fires on the
+    # directory containing the changed file, with the basename as the name.
+    # .NET's FileSystemWatcher expects this pattern — it sets up individual
+    # inotify watches on every subdirectory and looks for events there.
+    parent_rel = os.path.dirname(relative_path)
+    child_name = os.path.basename(relative_path)
 
-    # Path doesn't exist (deleted/moved) — walk up to nearest existing
-    # ancestor and poke it so directory watchers rescan
-    target = os.path.dirname(local_path)
-    while target and target != local_root:
-        if _inject_inotify(target, IN_ATTRIB):
-            log.info("%-12s %s (poked %s)", action_name, local_path, target)
-            return
-        target = os.path.dirname(target)
+    if parent_rel:
+        parent_dir = os.path.join(local_root, parent_rel)
+    else:
+        parent_dir = local_root
 
-    # Last resort: poke the root
-    if _inject_inotify(local_root, IN_ATTRIB):
-        log.info("%-12s %s (poked root)", action_name, local_path)
+    if _inject_inotify(parent_dir, mask, child_name=child_name):
+        log.info("%-12s %s (on %s)", action_name, local_path, parent_dir)
+    elif parent_rel:
+        # Parent directory might not be in the local dentry cache yet
+        # (e.g. new directory on NFS).  Fall back to root with full path.
+        log.debug("Parent inject failed, falling back to root: %s", local_root)
+        if _inject_inotify(local_root, mask, child_name=relative_path):
+            log.info("%-12s %s (on %s, fallback)", action_name, local_path, local_root)
+        else:
+            log.error("%-12s %s (inject failed)", action_name, local_path)
     else:
         log.error("%-12s %s (inject failed)", action_name, local_path)
 
@@ -626,6 +654,16 @@ def test_connection():
                         pass
 
 
+def _sigterm_handler(signum, frame):
+    """Log the signal so we can see what's killing us."""
+    import traceback
+    print(f"\n*** Caught signal {signum} (SIGTERM) ***", file=sys.stderr, flush=True)
+    print(f"*** PID: {os.getpid()} ***", file=sys.stderr, flush=True)
+    traceback.print_stack(frame, file=sys.stderr)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
 def main():
     if "--install" in sys.argv:
         install_all()
@@ -649,6 +687,9 @@ def main():
         print("The inotify_trigger kernel module is not loaded.")
         print("Run: python3 {0} --install".format(sys.argv[0]))
         sys.exit(1)
+
+    # Trap SIGTERM so we can see what's killing us
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     config = load_config()
 
