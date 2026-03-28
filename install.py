@@ -3,7 +3,7 @@
 Installer for SMB ChangeNotify to inotify Translator
 
 Handles:
-  - Building the C++ binary (libsmbclient-dev)
+  - Installing Python dependencies (smbprotocol)
   - Kernel module (inotify_trigger) build/install via DKMS
   - Systemd service setup
   - SMB connection testing
@@ -12,7 +12,7 @@ Usage:
   python3 install.py --install           # Full install
   python3 install.py --uninstall         # Full uninstall
   python3 install.py --reinstall-module  # Rebuild kernel module only
-  python3 install.py --build             # Build C++ binary only
+  python3 install.py --deps              # Install Python dependencies only
   python3 install.py --test              # Test SMB connections
 """
 
@@ -33,8 +33,7 @@ log = logging.getLogger("install")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BINARY_NAME = "smb_changenotify_to_inotify_translator"
-BINARY_PATH = SCRIPT_DIR / BINARY_NAME
-CPP_SOURCE = SCRIPT_DIR / f"{BINARY_NAME}.cpp"
+PY_SCRIPT = SCRIPT_DIR / f"{BINARY_NAME}.py"
 CONFIG_NAME = f"{BINARY_NAME}_config.json"
 INOTIFY_TRIGGER = "/proc/inotify_trigger"
 MODNAME = "inotify-trigger"
@@ -150,37 +149,18 @@ def _ensure_smbprotocol():
 
 
 # ---------------------------------------------------------------------------
-# Build
+# Python dependencies
 # ---------------------------------------------------------------------------
 
-def build_binary(debug=False):
-    """Compile the C++ binary."""
-    if not CPP_SOURCE.exists():
-        log.error("C++ source not found at: %s", CPP_SOURCE)
+def install_python_deps():
+    """Install Python dependencies (smbprotocol)."""
+    if not PY_SCRIPT.exists():
+        log.error("Python script not found at: %s", PY_SCRIPT)
         sys.exit(1)
 
-    log.info("--- Installing build dependencies ---")
-    run(["apt-get", "update", "-qq"])
-    run(["apt-get", "install", "-y", "-qq",
-         "g++", "libsmbclient-dev"])
-
-    log.info("--- Compiling %s ---", BINARY_NAME)
-    cmd = [
-        "g++", "-std=gnu++17", "-Wall",
-        "-I/usr/include/samba-4.0",
-        "-o", str(BINARY_PATH),
-        str(CPP_SOURCE),
-        "-lsmbclient",
-    ]
-    if debug:
-        cmd.insert(3, "-O0")
-        cmd.insert(4, "-DDEBUG")
-    else:
-        cmd.insert(3, "-O2")
-
-    run(cmd)
-    os.chmod(BINARY_PATH, 0o755)
-    log.info("Binary built: %s", BINARY_PATH)
+    log.info("--- Installing Python dependencies ---")
+    _pip_install("smbprotocol")
+    log.info("Python dependencies installed.")
 
 
 # ---------------------------------------------------------------------------
@@ -275,9 +255,8 @@ def install_all():
     """Full install: build binary, kernel module, systemd service."""
     log.info("=== Full install ===")
 
-    # 1. Build binary
-    log.info("--- C++ binary ---")
-    build_binary()
+    # 1. Python dependencies
+    install_python_deps()
 
     # 2. Kernel module
     log.info("--- Kernel module ---")
@@ -289,8 +268,8 @@ def install_all():
 
     # 3. Systemd service
     log.info("--- Systemd service ---")
-    if not BINARY_PATH.exists():
-        log.error("Binary not found at %s — build failed?", BINARY_PATH)
+    if not PY_SCRIPT.exists():
+        log.error("Python script not found at %s", PY_SCRIPT)
         sys.exit(1)
 
     service_content = f"""\
@@ -301,7 +280,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={BINARY_PATH}
+ExecStart={sys.executable} {PY_SCRIPT}
 WorkingDirectory={SCRIPT_DIR}
 Restart=always
 RestartSec=10
@@ -462,9 +441,8 @@ def main():
         uninstall_all()
     elif "--reinstall-module" in sys.argv:
         install_kernel_module()
-    elif "--build" in sys.argv:
-        debug = "--debug" in sys.argv
-        build_binary(debug=debug)
+    elif "--deps" in sys.argv:
+        install_python_deps()
     elif "--test" in sys.argv:
         test_connection()
     else:
